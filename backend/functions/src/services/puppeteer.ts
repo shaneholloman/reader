@@ -223,23 +223,7 @@ const MUTATION_IDLE_WATCH = `
 })();
 `;
 
-const DONT_MESS_WITH_THE_FUNDAMENTALS = `
-(()=> {
-    const fnToStringDesc = Object.getOwnPropertyDescriptor(Function.prototype, 'toString');
-    Object.defineProperty(Function.prototype, 'toString', {
-        get: ()=> fnToStringDesc.value,
-        set: ()=> 'Dont mess with this',
-        writeable: true,
-        configurable: false,
-        enumerable: false,
-    });
-})();
-delete Function.prototype.bind.apply;
-delete Function.prototype.bind.call;
-`;
-
 const SCRIPT_TO_INJECT_INTO_FRAME = `
-${DONT_MESS_WITH_THE_FUNDAMENTALS}
 ${READABILITY_JS}
 ${SIMULATE_SCROLL}
 ${MUTATION_IDLE_WATCH}
