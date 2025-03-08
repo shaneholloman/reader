@@ -1,4 +1,3 @@
-import { marshalErrorLike } from 'civkit/lang';
 import { AsyncService } from 'civkit/async-service';
 import { singleton } from 'tsyringe';
 
@@ -105,7 +104,7 @@ export class CurlControl extends AsyncService {
             curl.setOpt('URL', urlToCrawl.toString());
             curl.setOpt(Curl.option.FOLLOWLOCATION, false);
             curl.setOpt(Curl.option.SSL_VERIFYPEER, false);
-            curl.setOpt(Curl.option.TIMEOUT_MS, Math.min(30_000, crawlOpts?.timeoutMs || 30_000));
+            curl.setOpt(Curl.option.TIMEOUT_MS, crawlOpts?.timeoutMs || 30_000);
             curl.setOpt(Curl.option.CONNECTTIMEOUT_MS, 3_000);
             if (crawlOpts?.method) {
                 curl.setOpt(Curl.option.CUSTOMREQUEST, crawlOpts.method.toUpperCase());
@@ -136,18 +135,16 @@ export class CurlControl extends AsyncService {
             let curlStream: Readable | undefined;
             curl.on('error', (err, errCode) => {
                 curl.close();
-                this.logger.warn(`Curl ${urlToCrawl.origin}: ${err}`, { err: marshalErrorLike(err), urlToCrawl });
+                this.logger.warn(`Curl ${urlToCrawl.origin}: ${err}`, { err, urlToCrawl });
+                const err2 = this.digestCurlCode(errCode, err.message) ||
+                    new AssertionFailureError(`Failed to access ${urlToCrawl.origin}: ${err.message}`);
+                err2.cause ??= err;
                 if (curlStream) {
                     // For some reason, manually emitting error event is required for curlStream.
-                    curlStream.emit('error', err);
-                    curlStream.destroy(err);
+                    curlStream.emit('error', err2);
+                    curlStream.destroy(err2);
                 }
-                const err2 = this.digestCurlCode(errCode, err.message);
-                if (err2) {
-                    reject(err2);
-                    return;
-                }
-                reject(new AssertionFailureError(`Failed to access ${urlToCrawl.origin}: ${err.message}`));
+                reject(err2);
             });
             curl.setOpt(Curl.option.MAXFILESIZE, 4 * 1024 * 1024 * 1024); // 4GB
             let status = -1;
@@ -280,10 +277,7 @@ export class CurlControl extends AsyncService {
 
             if ([301, 302, 307, 308].includes(r.statusCode)) {
                 const headers = r.headers[r.headers.length - 1];
-                const location = headers.Location || headers.location;
-                if (!location) {
-                    throw new AssertionFailureError(`Failed to access ${urlToCrawl}: Bad redirection from ${nextHopUrl}`);
-                }
+                const location: string | undefined = headers.Location || headers.location;
 
                 const setCookieHeader = headers['Set-Cookie'] || headers['set-cookie'];
                 if (setCookieHeader) {
@@ -294,7 +288,11 @@ export class CurlControl extends AsyncService {
                     }
                 }
 
-                nextHopUrl = new URL(location, nextHopUrl);
+                if (!location && !setCookieHeader) {
+                    throw new AssertionFailureError(`Failed to access ${urlToCrawl}: Bad redirection from ${nextHopUrl}`);
+                }
+
+                nextHopUrl = new URL(location || '', nextHopUrl);
                 fakeHeaderInfos.push(...r.headers);
                 leftRedirection -= 1;
                 continue;
@@ -370,6 +368,7 @@ export class CurlControl extends AsyncService {
             }
 
             // Retryable errors
+            case CurlCode.CURLE_OPERATION_TIMEDOUT:
             case CurlCode.CURLE_SSL_CONNECT_ERROR:
             case CurlCode.CURLE_QUIC_CONNECT_ERROR:
             case CurlCode.CURLE_COULDNT_RESOLVE_PROXY:
