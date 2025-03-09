@@ -2,14 +2,13 @@ import os from 'os';
 import fs from 'fs';
 import { container, singleton } from 'tsyringe';
 import { AsyncService, Defer, marshalErrorLike, AssertionFailureError, delay, Deferred, perNextTick, ParamValidationError, FancyFile } from 'civkit';
-import { Logger } from '../shared/services/logger';
+import { GlobalLogger } from './logger';
 
 import type { Browser, CookieParam, GoToOptions, HTTPResponse, Page, Viewport } from 'puppeteer';
 import type { Cookie } from 'set-cookie-parser';
 import puppeteer from 'puppeteer-extra';
 
 import puppeteerBlockResources from 'puppeteer-extra-plugin-block-resources';
-import puppeteerPageProxy from 'puppeteer-extra-plugin-page-proxy';
 import { SecurityCompromiseError, ServiceCrashedError, ServiceNodeResourceDrainError } from '../shared/lib/errors';
 import { TimeoutError } from 'puppeteer';
 import _ from 'lodash';
@@ -106,9 +105,6 @@ export interface ScrappingOptions {
 
 puppeteer.use(puppeteerBlockResources({
     blockedTypes: new Set(['media']),
-    interceptResolutionPriority: 1,
-}));
-puppeteer.use(puppeteerPageProxy({
     interceptResolutionPriority: 1,
 }));
 
@@ -271,7 +267,7 @@ function getMaxDepthAndCountUsingTreeWalker(root) {
     root,
     NodeFilter.SHOW_ELEMENT,
     (node) => {
-      const nodeName = node.nodeName.toLowerCase();
+      const nodeName = node.nodeName?.toLowerCase();
       return (nodeName === 'svg') ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT;
     },
     false
@@ -472,7 +468,7 @@ export class PuppeteerControl extends AsyncService {
     lifeCycleTrack = new WeakMap();
 
     constructor(
-        protected globalLogger: Logger,
+        protected globalLogger: GlobalLogger,
         protected asyncLocalContext: AsyncLocalContext,
         protected curlControl: CurlControl,
         protected blackHoleDetector: BlackHoleDetector,
@@ -609,15 +605,15 @@ export class PuppeteerControl extends AsyncService {
             }
 
             const parsedUrl = new URL(requestUrl);
-            try {
-                if (isIP(parsedUrl.hostname)) {
-                    domainSet.add(parsedUrl.hostname);
-                } else {
+            if (isIP(parsedUrl.hostname)) {
+                domainSet.add(parsedUrl.hostname);
+            } else {
+                try {
                     const tldParsed = tldExtract(requestUrl);
                     domainSet.add(tldParsed.domain);
+                } catch (_err) {
+                    domainSet.add(parsedUrl.hostname);
                 }
-            } catch (err) {
-                return req.abort('blockedbyclient', 1000);
             }
 
             if (this.circuitBreakerHosts.has(parsedUrl.hostname.toLowerCase())) {
@@ -850,7 +846,7 @@ export class PuppeteerControl extends AsyncService {
             const proxy = options.proxyUrl || sideload?.proxyOrigin?.[reqUrlParsed.origin];
             const ctx = this.lifeCycleTrack.get(page);
             if (proxy && ctx) {
-                return this.asyncLocalContext.bridge(ctx, async () => {
+                return await this.asyncLocalContext.bridge(ctx, async () => {
                     try {
                         const curled = await this.curlControl.sideLoad(reqUrlParsed, {
                             ...options,
@@ -894,7 +890,7 @@ export class PuppeteerControl extends AsyncService {
                             headers: _.omit(firstReq, 'result'),
                         }, 999);
                     } catch (err: any) {
-                        this.logger.warn(`Failed to sideload ${reqUrlParsed.origin}`, { href: reqUrlParsed.href, err: marshalErrorLike(err) });
+                        this.logger.warn(`Failed to sideload browser request ${reqUrlParsed.origin}`, { href: reqUrlParsed.href, err, proxy });
                     }
                     if (req.isInterceptResolutionHandled()) {
                         return;
@@ -1102,7 +1098,7 @@ export class PuppeteerControl extends AsyncService {
                         snapshot.childFrames = await pSubFrameSnapshots;
                     }
                 } catch (err: any) {
-                    this.logger.warn(`Page ${sn}: Failed to finalize ${url}`, { err: marshalErrorLike(err) });
+                    this.logger.warn(`Page ${sn}: Failed to finalize ${url}`, { err });
                     if (stuff instanceof Error) {
                         finalized = true;
                         throw stuff;

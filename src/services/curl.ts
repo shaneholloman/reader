@@ -5,9 +5,10 @@ import { Curl, CurlCode, CurlFeature, HeaderInfo } from 'node-libcurl';
 import { parseString as parseSetCookieString } from 'set-cookie-parser';
 
 import { ScrappingOptions } from './puppeteer';
-import { Logger } from '../shared/services/logger';
+import { GlobalLogger } from './logger';
 import { AssertionFailureError, FancyFile } from 'civkit';
-import { ServiceBadAttemptError, TempFileManager } from '../shared';
+import { ServiceBadAttemptError, ServiceBadApproachError } from './errors';
+import { TempFileManager } from '../services/temp-file';
 import { createBrotliDecompress, createInflate, createGunzip } from 'zlib';
 import { ZSTDDecompress } from 'simple-zstd';
 import _ from 'lodash';
@@ -32,7 +33,7 @@ export class CurlControl extends AsyncService {
     lifeCycleTrack = new WeakMap();
 
     constructor(
-        protected globalLogger: Logger,
+        protected globalLogger: GlobalLogger,
         protected tempFileManager: TempFileManager,
         protected asyncLocalContext: AsyncLocalContext,
     ) {
@@ -115,7 +116,33 @@ export class CurlControl extends AsyncService {
 
             const headersToSet = { ...crawlOpts?.extraHeaders };
             if (crawlOpts?.cookies?.length) {
-                const cookieChunks = crawlOpts.cookies.map((cookie) => `${cookie.name}=${encodeURIComponent(cookie.value)}`);
+                const cookieKv: Record<string, string> = {};
+                for (const cookie of crawlOpts.cookies) {
+                    cookieKv[cookie.name] = cookie.value;
+                }
+                for (const cookie of crawlOpts.cookies) {
+                    if (cookie.maxAge && cookie.maxAge < 0) {
+                        delete cookieKv[cookie.name];
+                        continue;
+                    }
+                    if (cookie.expires && cookie.expires < new Date()) {
+                        delete cookieKv[cookie.name];
+                        continue;
+                    }
+                    if (cookie.secure && urlToCrawl.protocol !== 'https:') {
+                        delete cookieKv[cookie.name];
+                        continue;
+                    }
+                    if (cookie.domain && !urlToCrawl.hostname.endsWith(cookie.domain)) {
+                        delete cookieKv[cookie.name];
+                        continue;
+                    }
+                    if (cookie.path && !urlToCrawl.pathname.startsWith(cookie.path)) {
+                        delete cookieKv[cookie.name];
+                        continue;
+                    }
+                }
+                const cookieChunks = Object.entries(cookieKv).map(([k, v]) => `${k}=${encodeURIComponent(v)}`);
                 headersToSet.cookie ??= cookieChunks.join('; ');
             }
             if (crawlOpts?.referer) {
@@ -180,10 +207,10 @@ export class CurlControl extends AsyncService {
                 for (const [k, v] of Object.entries(lastResHeaders)) {
                     const kl = k.toLowerCase();
                     if (kl === 'content-type') {
-                        contentType = v.toLowerCase();
+                        contentType = (v || '').toLowerCase();
                     }
                     if (kl === 'content-encoding') {
-                        contentEncoding = v.toLowerCase();
+                        contentEncoding = (v || '').toLowerCase();
                     }
                     if (contentType && contentEncoding) {
                         break;
@@ -268,7 +295,8 @@ export class CurlControl extends AsyncService {
     }
 
     async urlToFile(urlToCrawl: URL, crawlOpts?: CURLScrappingOptions) {
-        let leftRedirection = 10;
+        let leftRedirection = 6;
+        let cookieRedirects = 0;
         let opts = { ...crawlOpts };
         let nextHopUrl = urlToCrawl;
         const fakeHeaderInfos: HeaderInfo[] = [];
@@ -276,6 +304,7 @@ export class CurlControl extends AsyncService {
             const r = await this.urlToFile1Shot(nextHopUrl, opts);
 
             if ([301, 302, 307, 308].includes(r.statusCode)) {
+                fakeHeaderInfos.push(...r.headers);
                 const headers = r.headers[r.headers.length - 1];
                 const location: string | undefined = headers.Location || headers.location;
 
@@ -286,14 +315,24 @@ export class CurlControl extends AsyncService {
                     if (parsed.length) {
                         opts.cookies = [...(opts.cookies || []), ...parsed];
                     }
+                    if (!location) {
+                        cookieRedirects += 1;
+                    }
                 }
 
                 if (!location && !setCookieHeader) {
-                    throw new AssertionFailureError(`Failed to access ${urlToCrawl}: Bad redirection from ${nextHopUrl}`);
+                    // Follow curl behavior
+                    return {
+                        statusCode: r.statusCode,
+                        data: r.data,
+                        headers: fakeHeaderInfos.concat(r.headers),
+                    };
+                }
+                if (!location && cookieRedirects > 1) {
+                    throw new ServiceBadApproachError(`Failed to access ${urlToCrawl}: Browser required to solve complex cookie preconditions.`);
                 }
 
                 nextHopUrl = new URL(location || '', nextHopUrl);
-                fakeHeaderInfos.push(...r.headers);
                 leftRedirection -= 1;
                 continue;
             }
@@ -305,7 +344,7 @@ export class CurlControl extends AsyncService {
             };
         } while (leftRedirection > 0);
 
-        throw new AssertionFailureError(`Failed to access ${urlToCrawl}: Too many redirections.`);
+        throw new ServiceBadAttemptError(`Failed to access ${urlToCrawl}: Too many redirections.`);
     }
 
     async sideLoad(targetUrl: URL, crawlOpts?: CURLScrappingOptions) {
@@ -327,14 +366,13 @@ export class CurlControl extends AsyncService {
             }
             if (headers.result?.code && [301, 302, 307, 308].includes(headers.result.code)) {
                 const location = headers.Location || headers.location;
-                if (!location) {
-                    throw new Error(`Bad redirection: ${curlResult.headers.length} times`);
+                if (location) {
+                    finalURL = new URL(location, finalURL);
                 }
-                finalURL = new URL(location, finalURL);
             }
         }
         const lastHeaders = curlResult.headers[curlResult.headers.length - 1];
-        const contentType = (lastHeaders['Content-Type'] || lastHeaders['content-type']).toLowerCase() || (await curlResult.data?.mimeType) || 'application/octet-stream';
+        const contentType = (lastHeaders['Content-Type'] || lastHeaders['content-type'])?.toLowerCase() || (await curlResult.data?.mimeType) || 'application/octet-stream';
         const contentDisposition = lastHeaders['Content-Disposition'] || lastHeaders['content-disposition'];
         const fileName = contentDisposition?.match(/filename="([^"]+)"/i)?.[1] || finalURL.pathname.split('/').pop();
 

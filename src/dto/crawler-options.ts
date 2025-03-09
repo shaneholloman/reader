@@ -1,6 +1,7 @@
 import { Also, AutoCastable, ParamValidationError, Prop, RPC_CALL_ENVIRONMENT } from 'civkit'; // Adjust the import based on where your decorators are defined
 import { Cookie, parseString as parseSetCookieString } from 'set-cookie-parser';
 import { Context } from '../services/registry';
+import { TurnDownTweakableOptions } from './turndown-tweakable-options';
 
 export enum CONTENT_FORMAT {
     CONTENT = 'content',
@@ -209,6 +210,41 @@ class Viewport extends AutoCastable {
                     in: 'header',
                     schema: { type: 'string' }
                 },
+                'X-Md-Heading-Style': {
+                    description: 'Heading style of the generated markdown.\n\nThis is an option passed through to [Turndown](https://github.com/mixmark-io/turndown?tab=readme-ov-file#options).\n\nSupported: setext, atx',
+                    in: 'header',
+                    schema: { type: 'string' }
+                },
+                'X-Md-Hr': {
+                    description: 'Hr text of the generated markdown.\n\nThis is an option passed through to [Turndown](https://github.com/mixmark-io/turndown?tab=readme-ov-file#options).',
+                    in: 'header',
+                    schema: { type: 'string' }
+                },
+                'X-Md-Bullet-List-Marker': {
+                    description: 'Bullet list marker of the generated markdown.\n\nThis is an option passed through to [Turndown](https://github.com/mixmark-io/turndown?tab=readme-ov-file#options).\n\nSupported: -, +, *',
+                    in: 'header',
+                    schema: { type: 'string' }
+                },
+                'X-Md-Em-Delimiter': {
+                    description: 'Em delimiter of the generated markdown.\n\nThis is an option passed through to [Turndown](https://github.com/mixmark-io/turndown?tab=readme-ov-file#options).\n\nSupported: _, *',
+                    in: 'header',
+                    schema: { type: 'string' }
+                },
+                'X-Md-Strong-Delimiter': {
+                    description: 'Strong delimiter of the generated markdown.\n\nThis is an option passed through to [Turndown](https://github.com/mixmark-io/turndown?tab=readme-ov-file#options).\n\nSupported: **, __',
+                    in: 'header',
+                    schema: { type: 'string' }
+                },
+                'X-Md-Link-Style': {
+                    description: 'Link style of the generated markdown.\n\nThis is an option passed through to [Turndown](https://github.com/mixmark-io/turndown?tab=readme-ov-file#options).\n\nSupported: inlined, referenced',
+                    in: 'header',
+                    schema: { type: 'string' }
+                },
+                'X-Md-Link-Reference-Style': {
+                    description: 'Link reference style of the generated markdown.\n\nThis is an option passed through to [Turndown](https://github.com/mixmark-io/turndown?tab=readme-ov-file#options).\n\nSupported: full, collapsed, shortcut',
+                    in: 'header',
+                    schema: { type: 'string' }
+                },
             }
         }
     }
@@ -353,6 +389,9 @@ export class CrawlerOptions extends AutoCastable {
     @Prop()
     doNotTrack?: number | null;
 
+    @Prop()
+    markdown?: TurnDownTweakableOptions;
+
     static override from(input: any) {
         const instance = super.from(input) as CrawlerOptions;
         const ctx = Reflect.get(input, RPC_CALL_ENVIRONMENT) as Context | undefined;
@@ -436,7 +475,6 @@ export class CrawlerOptions extends AutoCastable {
         instance.targetSelector ??= targetSelector?.length ? targetSelector : undefined;
         const waitForSelector = ctx?.get('x-wait-for-selector')?.split(', ').filter(Boolean);
         instance.waitForSelector ??= (waitForSelector?.length ? waitForSelector : undefined) || instance.targetSelector;
-        instance.targetSelector = filterSelector(instance.targetSelector);
         const overrideUserAgent = ctx?.get('x-user-agent') || undefined;
         instance.userAgent ??= overrideUserAgent;
 
@@ -509,6 +547,10 @@ export class CrawlerOptions extends AutoCastable {
 
         if (instance.cacheTolerance) {
             instance.cacheTolerance = instance.cacheTolerance * 1000;
+        }
+
+        if (ctx) {
+            instance.markdown ??= TurnDownTweakableOptions.fromCtx(ctx);
         }
 
         return instance;
@@ -591,20 +633,3 @@ export class CrawlerOptionsHeaderOnly extends CrawlerOptions {
         return instance;
     }
 }
-
-function filterSelector(s?: string | string[]) {
-    if (!s) {
-        return s;
-    }
-    const sr = Array.isArray(s) ? s : [s];
-    const selectors = sr.filter((i) => {
-        const innerSelectors = i.split(',').map((s) => s.trim());
-        const someViolation = innerSelectors.find((x) => x.startsWith('*') || x.startsWith(':') || x.includes('*:'));
-        if (someViolation) {
-            return false;
-        }
-        return true;
-    });
-
-    return selectors;
-};

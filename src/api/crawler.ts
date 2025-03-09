@@ -8,6 +8,7 @@ import {
     AssertionFailureError, ParamValidationError,
     RawString,
     ApplicationError,
+    DataStreamBrokenError,
 } from 'civkit/civ-rpc';
 import { marshalErrorLike } from 'civkit/lang';
 import { Defer } from 'civkit/defer';
@@ -32,14 +33,18 @@ import { GlobalLogger } from '../services/logger';
 import { RateLimitControl, RateLimitDesc } from '../shared/services/rate-limit';
 import { AsyncLocalContext } from '../services/async-context';
 import { Context, Ctx, Method, Param, RPCReflect } from '../services/registry';
-import { BudgetExceededError, InsufficientBalanceError, SecurityCompromiseError } from '../services/errors';
+import {
+    BudgetExceededError, InsufficientBalanceError,
+    SecurityCompromiseError, ServiceBadApproachError, ServiceBadAttemptError
+} from '../services/errors';
 
 import { countGPTToken as estimateToken } from '../shared/utils/openai';
 import { ProxyProvider } from '../shared/services/proxy-provider';
 import { FirebaseStorageBucketControl } from '../shared/services/firebase-storage-bucket';
 import { JinaEmbeddingsAuthDTO } from '../dto/jina-embeddings-auth';
 import { RobotsTxtService } from '../services/robots-text';
-import { ServiceBadAttemptError } from '../shared/lib/errors';
+import { lookup } from 'dns/promises';
+import { isIP } from 'net';
 
 export interface ExtraScrappingOptions extends ScrappingOptions {
     withIframe?: boolean | 'quoted';
@@ -463,7 +468,7 @@ export class CrawlerHost extends RPCHost {
         const targetUrlFromGet = originPath.slice(1);
         if (crawlerOptions.pdf) {
             const pdfBuf = crawlerOptions.pdf instanceof Blob ? await crawlerOptions.pdf.arrayBuffer().then((x) => Buffer.from(x)) : Buffer.from(crawlerOptions.pdf, 'base64');
-            url = `file://pdf.${md5Hasher.hash(pdfBuf)}`;
+            url = `blob://pdf/${md5Hasher.hash(pdfBuf)}`;
         } else if (targetUrlFromGet) {
             url = targetUrlFromGet.trim();
         } else if (crawlerOptions.url) {
@@ -493,10 +498,23 @@ export class CrawlerHost extends RPCHost {
             });
         }
 
-        if (!['http:', 'https:', 'file:'].includes(result.protocol)) {
+        if (!['http:', 'https:', 'blob:'].includes(result.protocol)) {
             throw new ParamValidationError({
                 message: `Invalid protocol ${result.protocol}`,
                 path: 'url'
+            });
+        }
+
+        if (!isIP(result.hostname)) {
+            await lookup(result.hostname).catch((err) => {
+                if (err.code === 'ENOTFOUND') {
+                    return Promise.reject(new ParamValidationError({
+                        message: `Domain '${result.hostname}' could not be resolved`,
+                        path: 'url'
+                    }));
+                }
+
+                return;
             });
         }
 
@@ -517,7 +535,19 @@ export class CrawlerHost extends RPCHost {
     async queryCache(urlToCrawl: URL, cacheTolerance: number) {
         const digest = this.getUrlDigest(urlToCrawl);
 
-        const cache = (await Crawled.fromFirestoreQuery(Crawled.COLLECTION.where('urlPathDigest', '==', digest).orderBy('createdAt', 'desc').limit(1)))?.[0];
+        const cache = (
+            await
+                (Crawled.fromFirestoreQuery(
+                    Crawled.COLLECTION.where('urlPathDigest', '==', digest).orderBy('createdAt', 'desc').limit(1)
+                ).catch((err) => {
+                    this.logger.warn(`Failed to query cache, unknown issue`, { err });
+                    // https://github.com/grpc/grpc-node/issues/2647
+                    // https://github.com/googleapis/nodejs-firestore/issues/1023
+                    // https://github.com/googleapis/nodejs-firestore/issues/1023
+
+                    return undefined;
+                }))
+        )?.[0];
 
         if (!cache) {
             return undefined;
@@ -733,61 +763,70 @@ export class CrawlerHost extends RPCHost {
             return;
         }
 
-        try {
-            const altOpts = { ...crawlOpts };
-            let sideLoaded = (crawlOpts?.allocProxy && !crawlOpts?.proxyUrl) ?
-                await this.sideLoadWithAllocatedProxy(urlToCrawl, altOpts) :
-                await this.curlControl.sideLoad(urlToCrawl, altOpts).catch((err) => {
-                    this.logger.warn(`Failed to side load ${urlToCrawl.origin}`, { err: marshalErrorLike(err), href: urlToCrawl.href });
+        if (crawlOpts?.engine !== ENGINE_TYPE.BROWSER && !this.knownUrlThatSideLoadingWouldCrashTheBrowser(urlToCrawl)) {
+            try {
+                const altOpts = { ...crawlOpts };
+                let sideLoaded = (crawlOpts?.allocProxy && !crawlOpts?.proxyUrl) ?
+                    await this.sideLoadWithAllocatedProxy(urlToCrawl, altOpts) :
+                    await this.curlControl.sideLoad(urlToCrawl, altOpts).catch((err) => {
+                        this.logger.warn(`Failed to side load ${urlToCrawl.origin}`, { err: marshalErrorLike(err), href: urlToCrawl.href });
 
-                    if (err instanceof ApplicationError && !(err instanceof ServiceBadAttemptError)) {
-                        return Promise.reject(err);
-                    }
+                        if (err instanceof ApplicationError && !(err instanceof ServiceBadAttemptError)) {
+                            return Promise.reject(err);
+                        }
 
-                    return this.sideLoadWithAllocatedProxy(urlToCrawl, altOpts);
-                });
-            if (!sideLoaded.file) {
-                throw new ServiceBadAttemptError(`Remote server did not return a body: ${urlToCrawl}`);
-            }
-            let draftSnapshot = await this.snapshotFormatter.createSnapshotFromFile(urlToCrawl, sideLoaded.file, sideLoaded.contentType, sideLoaded.fileName);
-            if (sideLoaded.status == 200 && !sideLoaded.contentType.startsWith('text/html')) {
-                yield draftSnapshot;
-                return;
-            }
-
-            let analyzed = await this.jsdomControl.analyzeHTMLTextLite(draftSnapshot.html);
-            draftSnapshot.title ??= analyzed.title;
-            let fallbackProxyIsUsed = false;
-            if ((!crawlOpts?.allocProxy && !crawlOpts?.proxyUrl) && (analyzed.tokens < 42 || sideLoaded.status !== 200)) {
-                const proxyLoaded = await this.sideLoadWithAllocatedProxy(urlToCrawl, altOpts);
-                if (!proxyLoaded.file) {
+                        return this.sideLoadWithAllocatedProxy(urlToCrawl, altOpts);
+                    });
+                if (!sideLoaded.file) {
                     throw new ServiceBadAttemptError(`Remote server did not return a body: ${urlToCrawl}`);
                 }
-                const proxySnapshot = await this.snapshotFormatter.createSnapshotFromFile(urlToCrawl, proxyLoaded.file, proxyLoaded.contentType, proxyLoaded.fileName);
-                analyzed = await this.jsdomControl.analyzeHTMLTextLite(proxySnapshot.html);
-                if (proxyLoaded.status === 200 || analyzed.tokens >= 200) {
-                    draftSnapshot = proxySnapshot;
-                    sideLoaded = proxyLoaded;
-                    fallbackProxyIsUsed = true;
+                let draftSnapshot = await this.snapshotFormatter.createSnapshotFromFile(urlToCrawl, sideLoaded.file, sideLoaded.contentType, sideLoaded.fileName);
+                if (sideLoaded.status == 200 && !sideLoaded.contentType.startsWith('text/html')) {
+                    yield draftSnapshot;
+                    return;
+                }
+
+                let analyzed = await this.jsdomControl.analyzeHTMLTextLite(draftSnapshot.html);
+                draftSnapshot.title ??= analyzed.title;
+                let fallbackProxyIsUsed = false;
+                if (((!crawlOpts?.allocProxy || crawlOpts.allocProxy === 'none') && !crawlOpts?.proxyUrl) &&
+                    (analyzed.tokens < 42 || sideLoaded.status !== 200)
+                ) {
+                    const proxyLoaded = await this.sideLoadWithAllocatedProxy(urlToCrawl, altOpts);
+                    if (!proxyLoaded.file) {
+                        throw new ServiceBadAttemptError(`Remote server did not return a body: ${urlToCrawl}`);
+                    }
+                    const proxySnapshot = await this.snapshotFormatter.createSnapshotFromFile(urlToCrawl, proxyLoaded.file, proxyLoaded.contentType, proxyLoaded.fileName);
+                    analyzed = await this.jsdomControl.analyzeHTMLTextLite(proxySnapshot.html);
+                    if (proxyLoaded.status === 200 || analyzed.tokens >= 200) {
+                        draftSnapshot = proxySnapshot;
+                        sideLoaded = proxyLoaded;
+                        fallbackProxyIsUsed = true;
+                    }
+                }
+
+                if (crawlOpts?.engine !== ENGINE_TYPE.BROWSER && crawlerOpts?.browserIsNotRequired()) {
+                    yield draftSnapshot;
+                }
+
+                if (crawlOpts && (sideLoaded.status === 200 || analyzed.tokens >= 200 || crawlOpts.allocProxy)) {
+                    this.logger.info(`Side load seems to work, applying to crawler.`, { url: urlToCrawl.href });
+                    crawlOpts.sideLoad ??= sideLoaded.sideLoadOpts;
+                    if (fallbackProxyIsUsed) {
+                        this.logger.info(`Proxy seems to salvage the page`, { url: urlToCrawl.href });
+                    }
+                }
+            } catch (err: any) {
+                this.logger.warn(`Failed to side load ${urlToCrawl.origin}`, { err: marshalErrorLike(err), href: urlToCrawl.href });
+                if (err instanceof ApplicationError &&
+                    !(err instanceof ServiceBadAttemptError) &&
+                    !(err instanceof DataStreamBrokenError)
+                ) {
+                    throw err;
                 }
             }
-
-            if (crawlOpts?.engine !== ENGINE_TYPE.BROWSER && crawlerOpts?.browserIsNotRequired()) {
-                yield draftSnapshot;
-            }
-
-            if (crawlOpts && (sideLoaded.status === 200 || analyzed.tokens >= 200 || crawlOpts.allocProxy)) {
-                this.logger.info(`Side load seems to work, applying to crawler.`, { url: urlToCrawl.href });
-                crawlOpts.sideLoad ??= sideLoaded.sideLoadOpts;
-                if (fallbackProxyIsUsed) {
-                    this.logger.info(`Proxy seems to salvage the page`, { url: urlToCrawl.href });
-                }
-            }
-        } catch (err: any) {
-            this.logger.warn(`Failed to side load ${urlToCrawl.origin}`, { err: marshalErrorLike(err), href: urlToCrawl.href });
-            if (err instanceof ApplicationError && !(err instanceof ServiceBadAttemptError)) {
-                throw err;
-            }
+        } else if (crawlOpts?.allocProxy && crawlOpts.allocProxy !== 'none' && !crawlOpts.proxyUrl) {
+            crawlOpts.proxyUrl = (await this.proxyProvider.alloc(crawlOpts.allocProxy)).href;
         }
 
         try {
@@ -904,6 +943,10 @@ export class CrawlerHost extends RPCHost {
         }
         this.threadLocal.set('retainImages', opts.retainImages);
         this.threadLocal.set('noGfm', opts.noGfm);
+        this.threadLocal.set('DNT', Boolean(opts.doNotTrack));
+        if (opts.markdown) {
+            this.threadLocal.set('turndownOpts', opts.markdown);
+        }
 
         const crawlOpts: ExtraScrappingOptions = {
             proxyUrl: opts.proxyUrl,
@@ -924,6 +967,21 @@ export class CrawlerHost extends RPCHost {
             proxyResources: (opts.proxyUrl || opts.proxy?.endsWith('+')) ? true : false,
             private: Boolean(opts.doNotTrack),
         };
+        if (crawlOpts.targetSelector?.length) {
+            if (typeof crawlOpts.targetSelector === 'string') {
+                crawlOpts.targetSelector = [crawlOpts.targetSelector];
+            }
+            for (const s of crawlOpts.targetSelector) {
+                for (const e of s.split(',').map((x) => x.trim())) {
+                    if (e.startsWith('*') || e.startsWith(':') || e.includes('*:')) {
+                        throw new ParamValidationError({
+                            message: `Unacceptable selector: '${e}'. We cannot accept match-all selector for performance reasons. Sorry.`,
+                            path: 'targetSelector'
+                        });
+                    }
+                }
+            }
+        }
 
         if (opts.locale) {
             crawlOpts.extraHeaders ??= {};
@@ -1000,15 +1058,28 @@ export class CrawlerHost extends RPCHost {
             const pdfUrl = snapshotCopy.pdfs[0];
             if (pdfUrl.startsWith('http')) {
                 const sideLoaded = scrappingOptions?.sideLoad?.impersonate[pdfUrl];
-                if (sideLoaded?.body) {
+                if (sideLoaded?.status === 200 && sideLoaded.body) {
                     snapshotCopy.pdfs[0] = pathToFileURL(await sideLoaded?.body.filePath).href;
                     return this.snapshotFormatter.formatSnapshot(mode, snapshotCopy, nominalUrl, urlValidMs);
                 }
 
-                const r = await this.curlControl.sideLoad(new URL(pdfUrl), scrappingOptions);
-                if (r.file) {
-                    snapshotCopy.pdfs[0] = pathToFileURL(await r.file.filePath).href;
+                const r = await this.curlControl.sideLoad(new URL(pdfUrl), scrappingOptions).catch((err) => {
+                    if (err instanceof ServiceBadAttemptError) {
+                        return Promise.reject(new AssertionFailureError(`Failed to load PDF(${pdfUrl}): ${err.message}`));
+                    }
+
+                    return Promise.reject(err);
+                });
+                if (r.status !== 200) {
+                    throw new AssertionFailureError(`Failed to load PDF(${pdfUrl}): Server responded status ${r.status}`);
                 }
+                if (!r.contentType.includes('application/pdf')) {
+                    throw new AssertionFailureError(`Failed to load PDF(${pdfUrl}): Server responded with wrong content type ${r.contentType}`);
+                }
+                if (!r.file) {
+                    throw new AssertionFailureError(`Failed to load PDF(${pdfUrl}): Server did not return a body`);
+                }
+                snapshotCopy.pdfs[0] = pathToFileURL(await r.file.filePath).href;
             }
         }
 
@@ -1145,6 +1216,9 @@ export class CrawlerHost extends RPCHost {
     }
 
     @retryWith((err) => {
+        if (err instanceof ServiceBadApproachError) {
+            return false;
+        }
         if (err instanceof ServiceBadAttemptError) {
             // Keep trying
             return true;
@@ -1156,6 +1230,9 @@ export class CrawlerHost extends RPCHost {
         return undefined;
     }, 3)
     async sideLoadWithAllocatedProxy(url: URL, opts?: ExtraScrappingOptions) {
+        if (opts?.allocProxy === 'none') {
+            return this.curlControl.sideLoad(url, opts);
+        }
         const proxy = await this.proxyProvider.alloc(opts?.allocProxy);
         const r = await this.curlControl.sideLoad(url, {
             ...opts,
@@ -1167,5 +1244,13 @@ export class CrawlerHost extends RPCHost {
         }
 
         return { ...r, proxy };
+    }
+
+    knownUrlThatSideLoadingWouldCrashTheBrowser(url: URL) {
+        if (url.hostname === 'chromewebstore.google.com') {
+            return true;
+        }
+
+        return false;
     }
 }
