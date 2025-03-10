@@ -46,6 +46,8 @@ import { RobotsTxtService } from '../services/robots-text';
 import { lookup } from 'dns/promises';
 import { isIP } from 'net';
 
+const normalizeUrl = require('@esm2cjs/normalize-url').default;
+
 export interface ExtraScrappingOptions extends ScrappingOptions {
     withIframe?: boolean | 'quoted';
     withShadowDom?: boolean;
@@ -112,7 +114,12 @@ export class CrawlerHost extends RPCHost {
             const analyzed = await this.jsdomControl.analyzeHTMLTextLite(snapshot.html);
             if (analyzed.tokens < 200) {
                 // Does not contain enough content
-                return;
+                if (snapshot.status !== 200) {
+                    return;
+                }
+                if (snapshot.html.includes('captcha') || snapshot.html.includes('cf-turnstile')) {
+                    return;
+                }
             }
 
             await this.setToCache(options.url, snapshot);
@@ -137,7 +144,9 @@ export class CrawlerHost extends RPCHost {
     override async init() {
         await this.dependencyReady();
 
-        this.curlControl.impersonateChrome(this.puppeteerControl.ua.replace(/Headless/i, ''));
+        if (this.puppeteerControl.ua) {
+            this.curlControl.impersonateChrome(this.puppeteerControl.ua.replace(/Headless/i, ''));
+        }
 
         this.emit('ready');
     }
@@ -226,7 +235,8 @@ export class CrawlerHost extends RPCHost {
         let chargeAmount = 0;
         const crawlerOptions = ctx.method === 'GET' ? crawlerOptionsHeaderOnly : crawlerOptionsParamsAllowed;
 
-        const targetUrl = await this.getTargetUrl(tryDecodeURIComponent(ctx.path), crawlerOptions);
+        // Use koa ctx.URL, a standard URL object to avoid node.js framework prop naming confusion
+        const targetUrl = await this.getTargetUrl(tryDecodeURIComponent(`${ctx.URL.pathname}${ctx.URL.search}`), crawlerOptions);
         if (!targetUrl) {
             return await this.getIndex(auth);
         }
@@ -302,11 +312,10 @@ export class CrawlerHost extends RPCHost {
             }
         }
 
+        const crawlOpts = await this.configure(crawlerOptions);
         if (crawlerOptions.robotsTxt) {
             await this.robotsTxtService.assertAccessAllowed(targetUrl, crawlerOptions.robotsTxt);
         }
-
-        const crawlOpts = await this.configure(crawlerOptions);
         if (!ctx.accepts('text/plain') && ctx.accepts('text/event-stream')) {
             const sseStream = new OutputServerEventStream();
             rpcReflect.return(sseStream);
@@ -467,8 +476,7 @@ export class CrawlerHost extends RPCHost {
 
         const targetUrlFromGet = originPath.slice(1);
         if (crawlerOptions.pdf) {
-            const pdfBuf = crawlerOptions.pdf instanceof Blob ? await crawlerOptions.pdf.arrayBuffer().then((x) => Buffer.from(x)) : Buffer.from(crawlerOptions.pdf, 'base64');
-            url = `blob://pdf/${md5Hasher.hash(pdfBuf)}`;
+            url = `blob://pdf/${randomUUID()}`;
         } else if (targetUrlFromGet) {
             url = targetUrlFromGet.trim();
         } else if (crawlerOptions.url) {
@@ -478,7 +486,6 @@ export class CrawlerHost extends RPCHost {
         }
 
         let result: URL;
-        const normalizeUrl = require('@esm2cjs/normalize-url').default;
         try {
             result = new URL(
                 normalizeUrl(
@@ -505,7 +512,27 @@ export class CrawlerHost extends RPCHost {
             });
         }
 
-        if (!isIP(result.hostname)) {
+
+        if (this.puppeteerControl.circuitBreakerHosts.has(result.hostname.toLowerCase())) {
+            throw new SecurityCompromiseError({
+                message: `Circular hostname: ${result.protocol}`,
+                path: 'url'
+            });
+        }
+
+        const isIp = isIP(result.hostname);
+
+        if (
+            (result.hostname === 'localhost') ||
+            (isIp && result.hostname.startsWith('127.'))
+        ) {
+            throw new SecurityCompromiseError({
+                message: `Suspicious action: Request to localhost: ${result}`,
+                path: 'url'
+            });
+        }
+
+        if (!isIp && result.protocol !== 'blob:') {
             await lookup(result.hostname).catch((err) => {
                 if (err.code === 'ENOTFOUND') {
                     return Promise.reject(new ParamValidationError({
@@ -780,7 +807,14 @@ export class CrawlerHost extends RPCHost {
                 if (!sideLoaded.file) {
                     throw new ServiceBadAttemptError(`Remote server did not return a body: ${urlToCrawl}`);
                 }
-                let draftSnapshot = await this.snapshotFormatter.createSnapshotFromFile(urlToCrawl, sideLoaded.file, sideLoaded.contentType, sideLoaded.fileName);
+                let draftSnapshot = await this.snapshotFormatter.createSnapshotFromFile(
+                    urlToCrawl, sideLoaded.file, sideLoaded.contentType, sideLoaded.fileName
+                ).catch((err) => {
+                    if (err instanceof ApplicationError) {
+                        return Promise.reject(new ServiceBadAttemptError(err.message));
+                    }
+                    return Promise.reject(err);
+                });
                 if (sideLoaded.status == 200 && !sideLoaded.contentType.startsWith('text/html')) {
                     yield draftSnapshot;
                     return;
@@ -796,7 +830,14 @@ export class CrawlerHost extends RPCHost {
                     if (!proxyLoaded.file) {
                         throw new ServiceBadAttemptError(`Remote server did not return a body: ${urlToCrawl}`);
                     }
-                    const proxySnapshot = await this.snapshotFormatter.createSnapshotFromFile(urlToCrawl, proxyLoaded.file, proxyLoaded.contentType, proxyLoaded.fileName);
+                    const proxySnapshot = await this.snapshotFormatter.createSnapshotFromFile(
+                        urlToCrawl, proxyLoaded.file, proxyLoaded.contentType, proxyLoaded.fileName
+                    ).catch((err) => {
+                        if (err instanceof ApplicationError) {
+                            return Promise.reject(new ServiceBadAttemptError(err.message));
+                        }
+                        return Promise.reject(err);
+                    });
                     analyzed = await this.jsdomControl.analyzeHTMLTextLite(proxySnapshot.html);
                     if (proxyLoaded.status === 200 || analyzed.tokens >= 200) {
                         draftSnapshot = proxySnapshot;

@@ -14,6 +14,7 @@ import { ZSTDDecompress } from 'simple-zstd';
 import _ from 'lodash';
 import { Readable } from 'stream';
 import { AsyncLocalContext } from './async-context';
+import { BlackHoleDetector } from './blackhole-detector';
 
 export interface CURLScrappingOptions extends ScrappingOptions {
     method?: string;
@@ -36,6 +37,7 @@ export class CurlControl extends AsyncService {
         protected globalLogger: GlobalLogger,
         protected tempFileManager: TempFileManager,
         protected asyncLocalContext: AsyncLocalContext,
+        protected blackHoleDetector: BlackHoleDetector,
     ) {
         super(...arguments);
     }
@@ -217,7 +219,7 @@ export class CurlControl extends AsyncService {
                     }
                 }
 
-                if ([301, 302, 307, 308].includes(statusCode)) {
+                if ([301, 302, 303, 307, 308].includes(statusCode)) {
                     if (stream) {
                         stream.resume();
                     }
@@ -303,7 +305,7 @@ export class CurlControl extends AsyncService {
         do {
             const r = await this.urlToFile1Shot(nextHopUrl, opts);
 
-            if ([301, 302, 307, 308].includes(r.statusCode)) {
+            if ([301, 302, 303, 307, 308].includes(r.statusCode)) {
                 fakeHeaderInfos.push(...r.headers);
                 const headers = r.headers[r.headers.length - 1];
                 const location: string | undefined = headers.Location || headers.location;
@@ -349,7 +351,7 @@ export class CurlControl extends AsyncService {
 
     async sideLoad(targetUrl: URL, crawlOpts?: CURLScrappingOptions) {
         const curlResult = await this.urlToFile(targetUrl, crawlOpts);
-
+        this.blackHoleDetector.itWorked();
         let finalURL = targetUrl;
         const sideLoadOpts: CURLScrappingOptions['sideLoad'] = {
             impersonate: {},
@@ -399,20 +401,28 @@ export class CurlControl extends AsyncService {
     digestCurlCode(code: CurlCode, msg: string) {
         switch (code) {
             // 400 User errors
-            case CurlCode.CURLE_GOT_NOTHING:
             case CurlCode.CURLE_COULDNT_RESOLVE_HOST:
-            case CurlCode.CURLE_REMOTE_ACCESS_DENIED: {
-                return new AssertionFailureError(msg);
+                {
+                    return new AssertionFailureError(msg);
+                }
+
+            // Maybe retry but dont retry with curl again
+            case CurlCode.CURLE_UNSUPPORTED_PROTOCOL:
+            case CurlCode.CURLE_PEER_FAILED_VERIFICATION: {
+                return new ServiceBadApproachError(msg);
             }
 
             // Retryable errors
+            case CurlCode.CURLE_REMOTE_ACCESS_DENIED:
+            case CurlCode.CURLE_SEND_ERROR:
+            case CurlCode.CURLE_RECV_ERROR:
+            case CurlCode.CURLE_GOT_NOTHING:
             case CurlCode.CURLE_OPERATION_TIMEDOUT:
             case CurlCode.CURLE_SSL_CONNECT_ERROR:
             case CurlCode.CURLE_QUIC_CONNECT_ERROR:
             case CurlCode.CURLE_COULDNT_RESOLVE_PROXY:
             case CurlCode.CURLE_COULDNT_CONNECT:
-            case CurlCode.CURLE_PARTIAL_FILE:
-            case CurlCode.CURLE_OPERATION_TIMEDOUT: {
+            case CurlCode.CURLE_PARTIAL_FILE: {
                 return new ServiceBadAttemptError(msg);
             }
 

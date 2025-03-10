@@ -1,6 +1,7 @@
 import { singleton } from 'tsyringe';
 import { AsyncService } from 'civkit/async-service';
 import { GlobalLogger } from './logger';
+import { delay } from 'civkit/timeout';
 
 
 @singleton()
@@ -22,7 +23,7 @@ export class BlackHoleDetector extends AsyncService {
         if (process.env.NODE_ENV?.startsWith('prod')) {
             setInterval(() => {
                 this.routine();
-            }, 1000 * 15).unref();
+            }, 1000 * 30).unref();
         }
     }
 
@@ -32,14 +33,16 @@ export class BlackHoleDetector extends AsyncService {
         this.emit('ready');
     }
 
-    routine() {
+    async routine() {
+        // We give routine a 3s grace period for potentially paused CPU to spin up and process some requests
+        await delay(3000);
         const now = Date.now();
         const lastWorked = this.lastWorkedTs;
         if (!lastWorked) {
             return;
         }
         const dt = (now - lastWorked);
-        if (this.concurrentRequests > 0 &&
+        if (this.concurrentRequests > 1 &&
             this.lastIncomingRequestTs && lastWorked &&
             this.lastIncomingRequestTs >= lastWorked &&
             (dt > (this.maxDelay * (this.strikes + 1)))
@@ -50,7 +53,10 @@ export class BlackHoleDetector extends AsyncService {
 
         if (this.strikes >= 3) {
             this.logger.error(`BlackHole detected for ${this.strikes} strikes, last worked: ${Math.ceil(dt / 1000)}s ago, concurrentRequests: ${this.concurrentRequests}`);
-            this.emit('error', new Error(`BlackHole detected for ${this.strikes} strikes, last worked: ${Math.ceil(dt / 1000)}s ago, concurrentRequests: ${this.concurrentRequests}`));
+            process.nextTick(() => {
+                this.emit('error', new Error(`BlackHole detected for ${this.strikes} strikes, last worked: ${Math.ceil(dt / 1000)}s ago, concurrentRequests: ${this.concurrentRequests}`));
+                // process.exit(1);
+            });
         }
     }
 

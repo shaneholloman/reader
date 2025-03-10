@@ -74,7 +74,7 @@ class Viewport extends AutoCastable {
                     schema: { type: 'string' }
                 },
                 'X-Respond-With': {
-                    description: `Specifies the (non-default) form factor of the crawled data you prefer.\n\n` +
+                    description: `Specifies the (non-default) form of the crawled data you prefer.\n\n` +
                         `Supported formats: \n` +
                         `- markdown\n` +
                         `- html\n` +
@@ -82,7 +82,9 @@ class Viewport extends AutoCastable {
                         `- pageshot\n` +
                         `- screenshot\n` +
                         `- content\n` +
-                        `- any combination of the above\n\n` +
+                        `- any combination of the above\n` +
+                        `- readerlm-v2\n` +
+                        `- vlm\n\n` +
                         `Default: content\n`
                     ,
                     in: 'header',
@@ -128,7 +130,17 @@ class Viewport extends AutoCastable {
                     schema: { type: 'string' }
                 },
                 'X-Proxy': {
-                    description: `Use a proxy server provided by Jina AI.\n\nOptionally specify two-letter country code.`,
+                    description: `Use a proxy server provided by us.\n\nOptionally specify two-letter country code.`,
+                    in: 'header',
+                    schema: { type: 'string' }
+                },
+                'X-Robots-Txt': {
+                    description: `Load and conform to the respective robot.txt on the target origin.\n\nOptionally specify a bot UA to check against.\n\n`,
+                    in: 'header',
+                    schema: { type: 'string' }
+                },
+                'DNT': {
+                    description: `When set to 1, prevent the result of this request to be cached in the system.\n\n`,
                     in: 'header',
                     schema: { type: 'string' }
                 },
@@ -201,7 +213,7 @@ class Viewport extends AutoCastable {
                     schema: { type: 'string' }
                 },
                 'X-Engine': {
-                    description: 'Specify the engine to use for crawling.\n\nSupported: browser, direct, vlm, readerlm-v2',
+                    description: 'Specify the engine to use for crawling.\n\nSupported: browser, direct, cf-browser-rendering',
                     in: 'header',
                     schema: { type: 'string' }
                 },
