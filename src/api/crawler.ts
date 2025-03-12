@@ -13,12 +13,12 @@ import {
 import { marshalErrorLike } from 'civkit/lang';
 import { Defer } from 'civkit/defer';
 import { retryWith } from 'civkit/decorators';
+import { FancyFile } from 'civkit/fancy-file';
 
 import { CONTENT_FORMAT, CrawlerOptions, CrawlerOptionsHeaderOnly, ENGINE_TYPE } from '../dto/crawler-options';
 
 import { Crawled } from '../db/crawled';
 import { DomainBlockade } from '../db/domain-blockade';
-import { DomainProfile } from '../db/domain-profile';
 import { OutputServerEventStream } from '../lib/transform-server-event-stream';
 
 import { PageSnapshot, PuppeteerControl, ScrappingOptions } from '../services/puppeteer';
@@ -43,10 +43,8 @@ import { ProxyProvider } from '../shared/services/proxy-provider';
 import { FirebaseStorageBucketControl } from '../shared/services/firebase-storage-bucket';
 import { JinaEmbeddingsAuthDTO } from '../dto/jina-embeddings-auth';
 import { RobotsTxtService } from '../services/robots-text';
-import { lookup } from 'dns/promises';
-import { isIP } from 'net';
-
-const normalizeUrl = require('@esm2cjs/normalize-url').default;
+import { TempFileManager } from '../services/temp-file';
+import { MiscService } from '../services/misc';
 
 export interface ExtraScrappingOptions extends ScrappingOptions {
     withIframe?: boolean | 'quoted';
@@ -92,6 +90,8 @@ export class CrawlerHost extends RPCHost {
         protected rateLimitControl: RateLimitControl,
         protected threadLocal: AsyncLocalContext,
         protected robotsTxtService: RobotsTxtService,
+        protected tempFileManager: TempFileManager,
+        protected miscService: MiscService,
     ) {
         super(...arguments);
 
@@ -316,6 +316,9 @@ export class CrawlerHost extends RPCHost {
         if (crawlerOptions.robotsTxt) {
             await this.robotsTxtService.assertAccessAllowed(targetUrl, crawlerOptions.robotsTxt);
         }
+        if (rpcReflect.signal.aborted) {
+            return;
+        }
         if (!ctx.accepts('text/plain') && ctx.accepts('text/event-stream')) {
             const sseStream = new OutputServerEventStream();
             rpcReflect.return(sseStream);
@@ -362,10 +365,7 @@ export class CrawlerHost extends RPCHost {
                 if (rpcReflect.signal.aborted) {
                     break;
                 }
-                if (!crawlerOptions.isEarlyReturnApplicable()) {
-                    continue;
-                }
-                if (crawlerOptions.waitForSelector || !scrapped || await this.snapshotNotGoodEnough(scrapped)) {
+                if (!scrapped || !crawlerOptions.isSnapshotAcceptableForEarlyResponse(scrapped)) {
                     continue;
                 }
 
@@ -411,11 +411,7 @@ export class CrawlerHost extends RPCHost {
             if (rpcReflect.signal.aborted) {
                 break;
             }
-            if (!crawlerOptions.isEarlyReturnApplicable()) {
-                continue;
-            }
-
-            if (crawlerOptions.waitForSelector || !scrapped || await this.snapshotNotGoodEnough(scrapped)) {
+            if (!scrapped || !crawlerOptions.isSnapshotAcceptableForEarlyResponse(scrapped)) {
                 continue;
             }
 
@@ -426,13 +422,11 @@ export class CrawlerHost extends RPCHost {
             }
 
             if (crawlerOptions.respondWith === 'screenshot' && Reflect.get(formatted, 'screenshotUrl')) {
-
                 return assignTransferProtocolMeta(`${formatted.textRepresentation}`,
                     { code: 302, envelope: null, headers: { Location: Reflect.get(formatted, 'screenshotUrl') } }
                 );
             }
             if (crawlerOptions.respondWith === 'pageshot' && Reflect.get(formatted, 'pageshotUrl')) {
-
                 return assignTransferProtocolMeta(`${formatted.textRepresentation}`,
                     { code: 302, envelope: null, headers: { Location: Reflect.get(formatted, 'pageshotUrl') } }
                 );
@@ -472,76 +466,32 @@ export class CrawlerHost extends RPCHost {
     }
 
     async getTargetUrl(originPath: string, crawlerOptions: CrawlerOptions) {
-        let url: string;
+        let url: string = '';
 
         const targetUrlFromGet = originPath.slice(1);
         if (crawlerOptions.pdf) {
-            url = `blob://pdf/${randomUUID()}`;
+            const pdfFile = crawlerOptions.pdf;
+            const identifier = pdfFile instanceof FancyFile ? (await pdfFile.sha256Sum) : randomUUID();
+            url = `blob://pdf/${identifier}`;
+            crawlerOptions.url ??= url;
         } else if (targetUrlFromGet) {
             url = targetUrlFromGet.trim();
         } else if (crawlerOptions.url) {
             url = crawlerOptions.url.trim();
-        } else {
-            return null;
         }
 
-        let result: URL;
-        try {
-            result = new URL(
-                normalizeUrl(
-                    url,
-                    {
-                        stripWWW: false,
-                        removeTrailingSlash: false,
-                        removeSingleSlash: false,
-                        sortQueryParameters: false,
-                    }
-                )
-            );
-        } catch (err) {
+        if (!url) {
             throw new ParamValidationError({
-                message: `${err}`,
+                message: 'No URL provided',
                 path: 'url'
             });
         }
 
-        if (!['http:', 'https:', 'blob:'].includes(result.protocol)) {
-            throw new ParamValidationError({
-                message: `Invalid protocol ${result.protocol}`,
-                path: 'url'
-            });
-        }
-
-
+        const result = await this.miscService.assertNormalizedUrl(url);
         if (this.puppeteerControl.circuitBreakerHosts.has(result.hostname.toLowerCase())) {
             throw new SecurityCompromiseError({
                 message: `Circular hostname: ${result.protocol}`,
                 path: 'url'
-            });
-        }
-
-        const isIp = isIP(result.hostname);
-
-        if (
-            (result.hostname === 'localhost') ||
-            (isIp && result.hostname.startsWith('127.'))
-        ) {
-            throw new SecurityCompromiseError({
-                message: `Suspicious action: Request to localhost: ${result}`,
-                path: 'url'
-            });
-        }
-
-        if (!isIp && result.protocol !== 'blob:') {
-            await lookup(result.hostname).catch((err) => {
-                if (err.code === 'ENOTFOUND') {
-                    return Promise.reject(new ParamValidationError({
-                        message: `Domain '${result.hostname}' could not be resolved`,
-                        path: 'url'
-                    }));
-                }
-
-                return;
             });
         }
 
@@ -733,14 +683,14 @@ export class CrawlerHost extends RPCHost {
         }
 
         if (crawlerOpts?.pdf) {
-            const pdfBuf = crawlerOpts.pdf instanceof Blob ? await crawlerOpts.pdf.arrayBuffer().then((x) => Buffer.from(x)) : Buffer.from(crawlerOpts.pdf, 'base64');
-            const pdfDataUrl = `data:application/pdf;base64,${pdfBuf.toString('base64')}`;
+            const pdfFile = crawlerOpts.pdf instanceof FancyFile ? crawlerOpts.pdf : this.tempFileManager.cacheBuffer(Buffer.from(crawlerOpts.pdf, 'base64'));
+            const pdfLocalPath = pathToFileURL((await pdfFile.filePath));
             const snapshot = {
                 href: urlToCrawl.toString(),
-                html: `<!DOCTYPE html><html><head></head><body style="height: 100%; width: 100%; overflow: hidden; margin:0px; background-color: rgb(82, 86, 89);"><embed style="position:absolute; left: 0; top: 0;" width="100%" height="100%" src="${pdfDataUrl}"></body></html>`,
+                html: `<!DOCTYPE html><html><head></head><body style="height: 100%; width: 100%; overflow: hidden; margin:0px; background-color: rgb(82, 86, 89);"><embed style="position:absolute; left: 0; top: 0;" width="100%" height="100%" src="${crawlerOpts.url}"></body></html>`,
                 title: '',
                 text: '',
-                pdfs: [pdfDataUrl],
+                pdfs: [pdfLocalPath.href],
             } as PageSnapshot;
 
             yield this.jsdomControl.narrowSnapshot(snapshot, crawlOpts);
@@ -748,7 +698,11 @@ export class CrawlerHost extends RPCHost {
             return;
         }
 
-        if (crawlOpts?.engine === ENGINE_TYPE.DIRECT) {
+        if (
+            crawlOpts?.engine === ENGINE_TYPE.CURL ||
+            // deprecated name
+            crawlOpts?.engine === 'direct'
+        ) {
             const sideLoaded = (crawlOpts?.allocProxy && !crawlOpts?.proxyUrl) ?
                 await this.sideLoadWithAllocatedProxy(urlToCrawl, crawlOpts) :
                 await this.curlControl.sideLoad(urlToCrawl, crawlOpts);
@@ -822,6 +776,7 @@ export class CrawlerHost extends RPCHost {
 
                 let analyzed = await this.jsdomControl.analyzeHTMLTextLite(draftSnapshot.html);
                 draftSnapshot.title ??= analyzed.title;
+                draftSnapshot.isIntermediate = true;
                 let fallbackProxyIsUsed = false;
                 if (((!crawlOpts?.allocProxy || crawlOpts.allocProxy === 'none') && !crawlOpts?.proxyUrl) &&
                     (analyzed.tokens < 42 || sideLoaded.status !== 200)
@@ -841,6 +796,7 @@ export class CrawlerHost extends RPCHost {
                     analyzed = await this.jsdomControl.analyzeHTMLTextLite(proxySnapshot.html);
                     if (proxyLoaded.status === 200 || analyzed.tokens >= 200) {
                         draftSnapshot = proxySnapshot;
+                        draftSnapshot.isIntermediate = true;
                         sideLoaded = proxyLoaded;
                         fallbackProxyIsUsed = true;
                     }
@@ -1029,7 +985,7 @@ export class CrawlerHost extends RPCHost {
             crawlOpts.extraHeaders['Accept-Language'] = opts.locale;
         }
 
-        if (opts.engine?.toLowerCase() === ENGINE_TYPE.VLM) {
+        if (opts.respondWith.includes(CONTENT_FORMAT.VLM)) {
             crawlOpts.favorScreenshot = true;
         }
 
@@ -1183,62 +1139,6 @@ export class CrawlerHost extends RPCHost {
         }
 
         return this.snapshotFormatter.formatSnapshot(mode, lastSnapshot, url, this.urlValidMs);
-    }
-
-    async exploreDirectEngine(knownSnapshot: PageSnapshot) {
-        const realUrl = new URL(knownSnapshot.href);
-        const { digest, path } = this.getDomainProfileUrlDigest(realUrl);
-        const profile = await DomainProfile.fromFirestore(digest);
-
-        if (!profile) {
-            const record = DomainProfile.from({
-                _id: digest,
-                origin: realUrl.origin.toLowerCase(),
-                path,
-                triggerUrl: realUrl.href,
-                engine: knownSnapshot.htmlModifiedByJs ? ENGINE_TYPE.BROWSER : ENGINE_TYPE.DIRECT,
-                createdAt: new Date(),
-                expireAt: new Date(Date.now() + this.domainProfileRetentionMs),
-            });
-            await DomainProfile.save(record);
-
-            return;
-        }
-
-        if (profile.engine === ENGINE_TYPE.BROWSER) {
-            // Mixed engine, always use browser
-            return;
-        }
-
-        profile.origin = realUrl.origin.toLowerCase();
-        profile.triggerUrl = realUrl.href;
-        profile.path = path;
-        profile.engine = knownSnapshot.htmlModifiedByJs ? ENGINE_TYPE.BROWSER : ENGINE_TYPE.DIRECT;
-        profile.expireAt = new Date(Date.now() + this.domainProfileRetentionMs);
-
-        await DomainProfile.save(profile);
-
-        return;
-    }
-
-    async snapshotNotGoodEnough(snapshot: PageSnapshot) {
-        if (snapshot.pdfs?.length) {
-            return false;
-        }
-        if (!snapshot.title) {
-            return true;
-        }
-        if (snapshot.parsed?.content) {
-            return false;
-        }
-        if (snapshot.html) {
-            const r = await this.jsdomControl.analyzeHTMLTextLite(snapshot.html);
-            const tokens = r.tokens;
-            if (tokens < 200) {
-                return true;
-            }
-        }
-        return false;
     }
 
     getDomainProfileUrlDigest(url: URL) {

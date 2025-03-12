@@ -1,7 +1,9 @@
-import { Also, AutoCastable, ParamValidationError, Prop, RPC_CALL_ENVIRONMENT } from 'civkit'; // Adjust the import based on where your decorators are defined
+import { Also, AutoCastable, ParamValidationError, Prop, RPC_CALL_ENVIRONMENT } from 'civkit/civ-rpc';
+import { FancyFile } from 'civkit/fancy-file';
 import { Cookie, parseString as parseSetCookieString } from 'set-cookie-parser';
 import { Context } from '../services/registry';
 import { TurnDownTweakableOptions } from './turndown-tweakable-options';
+import type { PageSnapshot } from '../services/puppeteer';
 
 export enum CONTENT_FORMAT {
     CONTENT = 'content',
@@ -17,10 +19,16 @@ export enum CONTENT_FORMAT {
 export enum ENGINE_TYPE {
     AUTO = 'auto',
     BROWSER = 'browser',
-    DIRECT = 'direct',
-    VLM = 'vlm',
-    READER_LM = 'readerlm-v2',
+    CURL = 'curl',
     CF_BROWSER_RENDERING = 'cf-browser-rendering',
+}
+
+export enum RESPOND_TIMING {
+    HTML = 'html',
+    MUTATION_IDLE = 'mutation-idle',
+    RESOURCE_IDLE = 'resource-idle',
+    MEDIA_IDLE = 'media-idle',
+    NETWORK_IDLE = 'network-idle',
 }
 
 const CONTENT_FORMAT_VALUES = new Set<string>(Object.values(CONTENT_FORMAT));
@@ -212,6 +220,16 @@ class Viewport extends AutoCastable {
                     in: 'header',
                     schema: { type: 'string' }
                 },
+                'X-Respond-Timing': {
+                    description: `Explicitly specify the respond timing. One of the following:\n\n` +
+                        `- html: unrendered HTML is enough to return\n` +
+                        `- mutation-idle: wait for DOM mutations to settle and remain unchanged for at least 0.2s\n` +
+                        `- resource-idle: wait for no additional resources that would affect page logic and content SUCCEEDED loading for at least 0.5s\n` +
+                        `- media-idle: wait for no additional resources, including media resources, SUCCEEDED loading for at least 0.5s\n` +
+                        `- network-idle: wait for full load of webpage, as usual.\n\n`,
+                    in: 'header',
+                    schema: { type: 'string' }
+                },
                 'X-Engine': {
                     description: 'Specify the engine to use for crawling.\n\nSupported: browser, direct, cf-browser-rendering',
                     in: 'header',
@@ -248,12 +266,12 @@ class Viewport extends AutoCastable {
                     schema: { type: 'string' }
                 },
                 'X-Md-Link-Style': {
-                    description: 'Link style of the generated markdown.\n\nThis is an option passed through to [Turndown](https://github.com/mixmark-io/turndown?tab=readme-ov-file#options).\n\nSupported: inlined, referenced',
+                    description: 'Link style of the generated markdown.\n\nThis is an option passed through to [Turndown](https://github.com/mixmark-io/turndown?tab=readme-ov-file#options).\n\nSupported: inlined, referenced, discarded',
                     in: 'header',
                     schema: { type: 'string' }
                 },
                 'X-Md-Link-Reference-Style': {
-                    description: 'Link reference style of the generated markdown.\n\nThis is an option passed through to [Turndown](https://github.com/mixmark-io/turndown?tab=readme-ov-file#options).\n\nSupported: full, collapsed, shortcut',
+                    description: 'Link reference style of the generated markdown.\n\nThis is an option passed through to [Turndown](https://github.com/mixmark-io/turndown?tab=readme-ov-file#options).\n\nSupported: full, collapsed, shortcut, discarded',
                     in: 'header',
                     schema: { type: 'string' }
                 },
@@ -277,9 +295,9 @@ export class CrawlerOptions extends AutoCastable {
 
     @Prop({
         desc: 'Base64 encoded PDF.',
-        type: [File, String]
+        type: [FancyFile, String]
     })
-    pdf?: File | string;
+    pdf?: FancyFile | string;
 
     @Prop({
         default: CONTENT_FORMAT.CONTENT,
@@ -404,6 +422,11 @@ export class CrawlerOptions extends AutoCastable {
     @Prop()
     markdown?: TurnDownTweakableOptions;
 
+    @Prop({
+        type: RESPOND_TIMING,
+    })
+    respondTiming?: RESPOND_TIMING;
+
     static override from(input: any) {
         const instance = super.from(input) as CrawlerOptions;
         const ctx = Reflect.get(input, RPC_CALL_ENVIRONMENT) as Context | undefined;
@@ -497,10 +520,10 @@ export class CrawlerOptions extends AutoCastable {
         if (instance.engine) {
             instance.engine = instance.engine.toLowerCase();
         }
-        if (instance.engine === ENGINE_TYPE.VLM) {
+        if (instance.engine === 'vlm') {
             instance.engine = ENGINE_TYPE.BROWSER;
             instance.respondWith = CONTENT_FORMAT.VLM;
-        } else if (instance.engine === ENGINE_TYPE.READER_LM) {
+        } else if (instance.engine === 'readerlm-v2') {
             instance.engine = ENGINE_TYPE.AUTO;
             instance.respondWith = CONTENT_FORMAT.READER_LM;
         }
@@ -557,6 +580,18 @@ export class CrawlerOptions extends AutoCastable {
         const dnt = ctx?.get('dnt');
         instance.doNotTrack ??= (parseInt(dnt || '') || null);
 
+        const respondTiming = ctx?.get('x-respond-timing');
+        if (respondTiming) {
+            instance.respondTiming ??= respondTiming as RESPOND_TIMING;
+        }
+        if (instance.timeout) {
+            instance.respondTiming ??= RESPOND_TIMING.NETWORK_IDLE;
+        }
+        if (instance.respondWith.includes('shot') || instance.respondWith.includes('vlm')) {
+            instance.respondTiming ??= RESPOND_TIMING.MEDIA_IDLE;
+        }
+        instance.respondTiming ??= RESPOND_TIMING.RESOURCE_IDLE;
+
         if (instance.cacheTolerance) {
             instance.cacheTolerance = instance.cacheTolerance * 1000;
         }
@@ -568,21 +603,46 @@ export class CrawlerOptions extends AutoCastable {
         return instance;
     }
 
-    isEarlyReturnApplicable() {
-        if (this.timeout !== undefined) {
-            return false;
-        }
+    isSnapshotAcceptableForEarlyResponse(snapshot: PageSnapshot) {
         if (this.waitForSelector?.length) {
             return false;
         }
+        if (this.respondTiming === RESPOND_TIMING.HTML && snapshot.html) {
+            return true;
+        }
+        if (this.respondTiming === RESPOND_TIMING.MEDIA_IDLE && snapshot.lastMediaResourceLoaded && snapshot.lastMutationIdle) {
+            const now = Date.now();
+            if ((Math.max(snapshot.lastMediaResourceLoaded, snapshot.lastContentResourceLoaded || 0) + 500) < now) {
+                return true;
+            }
+        }
+        if ((this.respondWith.includes('vlm') || this.respondWith.includes('pageshot')) && !snapshot.pageshot) {
+            return false;
+        }
+        if ((this.respondWith.includes('vlm') || this.respondWith.includes('screenshot')) && !snapshot.screenshot) {
+            return false;
+        }
+        if (this.respondTiming === RESPOND_TIMING.RESOURCE_IDLE && snapshot.lastContentResourceLoaded && snapshot.lastMutationIdle) {
+            const now = Date.now();
+            if ((snapshot.lastContentResourceLoaded + 500) < now) {
+                return true;
+            }
+        }
+
         if (this.injectFrameScript?.length || this.injectPageScript?.length) {
             return false;
+        }
+        if (this.respondTiming === RESPOND_TIMING.NETWORK_IDLE) {
+            return false;
+        }
+        if (this.respondTiming === RESPOND_TIMING.MUTATION_IDLE && snapshot.lastMutationIdle) {
+            return true;
         }
         if (this.respondWith.includes('lm')) {
             return false;
         }
 
-        return true;
+        return false;
     }
 
     isCacheQueryApplicable() {
@@ -610,6 +670,9 @@ export class CrawlerOptions extends AutoCastable {
     }
 
     browserIsNotRequired() {
+        if (this.respondTiming && this.respondTiming !== RESPOND_TIMING.HTML) {
+            return false;
+        }
         if (this.respondWith.includes(CONTENT_FORMAT.PAGESHOT) || this.respondWith.includes(CONTENT_FORMAT.SCREENSHOT)) {
             return false;
         }
