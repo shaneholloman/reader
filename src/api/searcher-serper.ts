@@ -93,7 +93,7 @@ export class SearcherHost extends RPCHost {
         // We want to make our search API follow SERP schema, so we need to expose 'num' parameter.
         // Since we used 'count' as 'num' previously, we need to keep 'count' for old users.
         // Here we combine 'count' and 'num' to 'count' for the rest of the function.
-        count = (num !== undefined ? num : count) ?? 5;
+        count = (num !== undefined ? num : count) ?? 10;
 
         const uid = await auth.solveUID();
         // Return content by default
@@ -152,9 +152,15 @@ export class SearcherHost extends RPCHost {
 
         const crawlOpts = await this.crawler.configure(crawlerOptions);
         const searchQuery = searchExplicitOperators.addTo(q || noSlashPath);
+
+        let fetchNum = count;
+        if ((page ?? 1) === 1) {
+            fetchNum = count > 10 ? 30 : 20;
+        }
+
         const r = await this.cachedWebSearch({
             q: searchQuery,
-            num: count > 10 ? 30 : 20,
+            num: fetchNum,
             gl,
             hl,
             location,
@@ -237,6 +243,8 @@ export class SearcherHost extends RPCHost {
                         return;
                     }
                     chargeAmount = this.assignChargeAmount(lastScrapped, count);
+
+                    this.assignTokenUsage(lastScrapped, chargeAmount, crawlWithoutContent);
                     rpcReflect.return(lastScrapped);
                     earlyReturn = true;
                 }, ((crawlerOptions.timeout || 0) * 1000) || this.reasonableDelayMs);
