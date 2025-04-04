@@ -1,8 +1,9 @@
 import _ from 'lodash';
 import {
     Also, AuthenticationFailedError, AuthenticationRequiredError,
-    DownstreamServiceFailureError, RPC_CALL_ENVIRONMENT,
+    RPC_CALL_ENVIRONMENT,
     AutoCastable,
+    DownstreamServiceError,
 } from 'civkit/civ-rpc';
 import { htmlEscape } from 'civkit/escape';
 import { marshalErrorLike } from 'civkit/lang';
@@ -96,12 +97,14 @@ export class JinaEmbeddingsAuthDTO extends AutoCastable {
             });
         }
 
+        let firestoreDegradation = false;
         let account;
         try {
             account = await JinaEmbeddingsTokenAccount.fromFirestore(this.bearerToken);
         } catch (err) {
             // FireStore would not accept any string as input and may throw if not happy with it
-            void 0;
+            firestoreDegradation = true;
+            logger.warn(`Firestore issue`, { err });
         }
 
 
@@ -109,12 +112,37 @@ export class JinaEmbeddingsAuthDTO extends AutoCastable {
         const jitter = Math.ceil(Math.random() * 30 * 1000);
 
         if (account && !ignoreCache) {
-            if (account && (age < (180_000 - jitter))) {
+            if ((age < (180_000 - jitter)) && (account.wallet?.total_balance > 0)) {
                 this.user = account;
                 this.uid = this.user?.user_id;
 
                 return account;
             }
+        }
+
+        if (firestoreDegradation) {
+            logger.debug(`Using remote UC cached user`);
+            let r;
+            try {
+                r = await this.jinaEmbeddingsDashboard.authorization(this.bearerToken);
+            } catch (err: any) {
+                if (err?.status === 401) {
+                    throw new AuthenticationFailedError({
+                        message: 'Invalid API key, please get a new one from https://jina.ai'
+                    });
+                }
+                logger.warn(`Failed load remote cached user: ${err}`, { err });
+                throw new DownstreamServiceError(`Failed to authenticate: ${err}`);
+            }
+            const brief = r?.data;
+            const draftAccount = JinaEmbeddingsTokenAccount.from({
+                ...account, ...brief, _id: this.bearerToken,
+                lastSyncedAt: new Date()
+            });
+            this.user = draftAccount;
+            this.uid = this.user?.user_id;
+
+            return draftAccount;
         }
 
         try {
@@ -148,7 +176,7 @@ export class JinaEmbeddingsAuthDTO extends AutoCastable {
             }
 
 
-            throw new DownstreamServiceFailureError(`Failed to authenticate: ${err}`);
+            throw new DownstreamServiceError(`Failed to authenticate: ${err}`);
         }
     }
 
