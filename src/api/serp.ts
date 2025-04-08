@@ -69,7 +69,6 @@ export class SerpHost extends RPCHost {
             usage2: 'https://s.jina.ai/YOUR_SEARCH_QUERY',
             usage3: `${ctx.origin}/?q=YOUR_SEARCH_QUERY`,
             homepage: 'https://jina.ai/reader',
-            sourceCode: 'https://github.com/jina-ai/reader',
         });
 
         if (auth && auth.user) {
@@ -136,7 +135,7 @@ export class SerpHost extends RPCHost {
         @Param('hl', { validate: (v: string) => WORLD_LANGUAGES.some(l => l.code === v) }) hl?: string,
         @Param('location') location?: string,
         @Param('page') page?: number,
-        @Param('fallback', { default: true }) fallback?: boolean,
+        @Param('fallback') fallback?: boolean,
     ) {
         const authToken = auth.bearerToken;
         let highFreqKey: RateLimitCache | undefined;
