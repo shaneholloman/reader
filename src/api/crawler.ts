@@ -41,13 +41,13 @@ import {
 } from '../services/errors';
 
 import { countGPTToken as estimateToken } from '../shared/utils/openai';
-import { ProxyProvider } from '../shared/services/proxy-provider';
+import { ProxyProviderService } from '../shared/services/proxy-provider';
 import { FirebaseStorageBucketControl } from '../shared/services/firebase-storage-bucket';
 import { JinaEmbeddingsAuthDTO } from '../dto/jina-embeddings-auth';
 import { RobotsTxtService } from '../services/robots-text';
 import { TempFileManager } from '../services/temp-file';
 import { MiscService } from '../services/misc';
-import { HTTPServiceError } from 'civkit';
+import { HTTPServiceError } from 'civkit/http';
 import { GeoIPService } from '../services/geoip';
 
 export interface ExtraScrappingOptions extends ScrappingOptions {
@@ -87,7 +87,7 @@ export class CrawlerHost extends RPCHost {
         protected puppeteerControl: PuppeteerControl,
         protected curlControl: CurlControl,
         protected cfBrowserRendering: CFBrowserRendering,
-        protected proxyProvider: ProxyProvider,
+        protected proxyProvider: ProxyProviderService,
         protected lmControl: LmControl,
         protected jsdomControl: JSDomControl,
         protected snapshotFormatter: SnapshotFormatter,
@@ -114,6 +114,10 @@ export class CrawlerHost extends RPCHost {
                 return;
             }
             if (snapshot.isIntermediate) {
+                return;
+            }
+            if (!snapshot.lastMutationIdle) {
+                // Never reached mutationIdle, presumably too short timeout
                 return;
             }
             if (options.locale) {
@@ -153,8 +157,8 @@ export class CrawlerHost extends RPCHost {
     override async init() {
         await this.dependencyReady();
 
-        if (this.puppeteerControl.ua) {
-            this.curlControl.impersonateChrome(this.puppeteerControl.ua.replace(/Headless/i, ''));
+        if (this.puppeteerControl.effectiveUA) {
+            this.curlControl.impersonateChrome(this.puppeteerControl.effectiveUA);
         }
 
         this.emit('ready');
@@ -236,6 +240,7 @@ export class CrawlerHost extends RPCHost {
         const uid = await auth.solveUID();
         let chargeAmount = 0;
         const crawlerOptions = ctx.method === 'GET' ? crawlerOptionsHeaderOnly : crawlerOptionsParamsAllowed;
+        const tierPolicy = await this.saasAssertTierPolicy(crawlerOptions, auth);
 
         // Use koa ctx.URL, a standard URL object to avoid node.js framework prop naming confusion
         const targetUrl = await this.getTargetUrl(tryDecodeURIComponent(`${ctx.URL.pathname}${ctx.URL.search}`), crawlerOptions);
@@ -294,15 +299,13 @@ export class CrawlerHost extends RPCHost {
                 if (crawlerOptions.tokenBudget && chargeAmount > crawlerOptions.tokenBudget) {
                     return;
                 }
-                if (chargeAmount) {
-                    apiRoll._ref?.set({
-                        chargeAmount,
-                    }, { merge: true }).catch((err) => this.logger.warn(`Failed to log charge amount in apiRoll`, { err }));
-                }
+                apiRoll.chargeAmount = chargeAmount;
             });
         }
 
         if (!uid) {
+            // Enforce no proxy is allocated for anonymous users due to abuse.
+            crawlerOptions.proxy = 'none';
             const blockade = (await DomainBlockade.fromFirestoreQuery(
                 DomainBlockade.COLLECTION
                     .where('domain', '==', targetUrl.hostname.toLowerCase())
@@ -313,7 +316,6 @@ export class CrawlerHost extends RPCHost {
                 throw new SecurityCompromiseError(`Domain ${targetUrl.hostname} blocked until ${blockade.expireAt || 'Eternally'} due to previous abuse found on ${blockade.triggerUrl || 'site'}: ${blockade.triggerReason}`);
             }
         }
-
         const crawlOpts = await this.configure(crawlerOptions);
         if (crawlerOptions.robotsTxt) {
             await this.robotsTxtService.assertAccessAllowed(targetUrl, crawlerOptions.robotsTxt);
@@ -335,10 +337,7 @@ export class CrawlerHost extends RPCHost {
                     }
 
                     const formatted = await this.formatSnapshot(crawlerOptions, scrapped, targetUrl, this.urlValidMs, crawlOpts);
-                    chargeAmount = this.assignChargeAmount(formatted, crawlerOptions);
-                    if (crawlerOptions.tokenBudget && chargeAmount > crawlerOptions.tokenBudget) {
-                        throw new BudgetExceededError(`Token budget (${crawlerOptions.tokenBudget}) exceeded, intended charge amount ${chargeAmount}.`);
-                    }
+                    chargeAmount = this.assignChargeAmount(formatted, tierPolicy);
                     sseStream.write({
                         event: 'data',
                         data: formatted,
@@ -376,11 +375,7 @@ export class CrawlerHost extends RPCHost {
                     }
 
                     const formatted = await this.formatSnapshot(crawlerOptions, scrapped, targetUrl, this.urlValidMs, crawlOpts);
-                    chargeAmount = this.assignChargeAmount(formatted, crawlerOptions);
-
-                    if (crawlerOptions.tokenBudget && chargeAmount > crawlerOptions.tokenBudget) {
-                        throw new BudgetExceededError(`Token budget (${crawlerOptions.tokenBudget}) exceeded, intended charge amount ${chargeAmount}.`);
-                    }
+                    chargeAmount = this.assignChargeAmount(formatted, tierPolicy);
 
                     if (scrapped?.pdfs?.length && !chargeAmount) {
                         continue;
@@ -402,10 +397,7 @@ export class CrawlerHost extends RPCHost {
             }
 
             const formatted = await this.formatSnapshot(crawlerOptions, lastScrapped, targetUrl, this.urlValidMs, crawlOpts);
-            chargeAmount = this.assignChargeAmount(formatted, crawlerOptions);
-            if (crawlerOptions.tokenBudget && chargeAmount > crawlerOptions.tokenBudget) {
-                throw new BudgetExceededError(`Token budget (${crawlerOptions.tokenBudget}) exceeded, intended charge amount ${chargeAmount}.`);
-            }
+            chargeAmount = this.assignChargeAmount(formatted, tierPolicy);
 
             return formatted;
         }
@@ -431,10 +423,7 @@ export class CrawlerHost extends RPCHost {
                 }
 
                 const formatted = await this.formatSnapshot(crawlerOptions, scrapped, targetUrl, this.urlValidMs, crawlOpts);
-                chargeAmount = this.assignChargeAmount(formatted, crawlerOptions);
-                if (crawlerOptions.tokenBudget && chargeAmount > crawlerOptions.tokenBudget) {
-                    throw new BudgetExceededError(`Token budget (${crawlerOptions.tokenBudget}) exceeded, intended charge amount ${chargeAmount}.`);
-                }
+                chargeAmount = this.assignChargeAmount(formatted, tierPolicy);
 
                 if (crawlerOptions.respondWith === 'screenshot' && Reflect.get(formatted, 'screenshotUrl')) {
                     return assignTransferProtocolMeta(`${formatted.textRepresentation}`,
@@ -461,12 +450,8 @@ export class CrawlerHost extends RPCHost {
             }
             throw new AssertionFailureError(`No content available for URL ${targetUrl}`);
         }
-
         const formatted = await this.formatSnapshot(crawlerOptions, lastScrapped, targetUrl, this.urlValidMs, crawlOpts);
-        chargeAmount = this.assignChargeAmount(formatted, crawlerOptions);
-        if (crawlerOptions.tokenBudget && chargeAmount > crawlerOptions.tokenBudget) {
-            throw new BudgetExceededError(`Token budget (${crawlerOptions.tokenBudget}) exceeded, intended charge amount ${chargeAmount}.`);
-        }
+        chargeAmount = this.assignChargeAmount(formatted, tierPolicy);
 
         if (crawlerOptions.respondWith === 'screenshot' && Reflect.get(formatted, 'screenshotUrl')) {
 
@@ -798,6 +783,8 @@ export class CrawlerHost extends RPCHost {
         }
 
         if (crawlOpts?.engine !== ENGINE_TYPE.BROWSER && !this.knownUrlThatSideLoadingWouldCrashTheBrowser(urlToCrawl)) {
+            const sideLoadSnapshotPermitted = crawlerOpts?.browserIsNotRequired() &&
+                [RESPOND_TIMING.HTML, RESPOND_TIMING.VISIBLE_CONTENT].includes(crawlerOpts.presumedRespondTiming);
             try {
                 const altOpts = { ...crawlOpts };
                 let sideLoaded = (crawlOpts?.allocProxy && !crawlOpts?.proxyUrl) ?
@@ -832,11 +819,12 @@ export class CrawlerHost extends RPCHost {
                 let analyzed = await this.jsdomControl.analyzeHTMLTextLite(draftSnapshot.html);
                 draftSnapshot.title ??= analyzed.title;
                 draftSnapshot.isIntermediate = true;
-                if (crawlerOpts?.browserIsNotRequired()) {
+                if (sideLoadSnapshotPermitted) {
                     yield this.jsdomControl.narrowSnapshot(draftSnapshot, crawlOpts);
                 }
                 let fallbackProxyIsUsed = false;
-                if (((!crawlOpts?.allocProxy || crawlOpts.allocProxy === 'none') && !crawlOpts?.proxyUrl) &&
+                if (
+                    ((!crawlOpts?.allocProxy || crawlOpts.allocProxy !== 'none') && !crawlOpts?.proxyUrl) &&
                     (analyzed.tokens < 42 || sideLoaded.status !== 200)
                 ) {
                     const proxyLoaded = await this.sideLoadWithAllocatedProxy(urlToCrawl, altOpts);
@@ -858,7 +846,7 @@ export class CrawlerHost extends RPCHost {
                     analyzed = await this.jsdomControl.analyzeHTMLTextLite(proxySnapshot.html);
                     if (proxyLoaded.status === 200 || analyzed.tokens >= 200) {
                         proxySnapshot.isIntermediate = true;
-                        if (crawlerOpts?.browserIsNotRequired()) {
+                        if (sideLoadSnapshotPermitted) {
                             yield this.jsdomControl.narrowSnapshot(proxySnapshot, crawlOpts);
                         }
                         sideLoaded = proxyLoaded;
@@ -907,18 +895,14 @@ export class CrawlerHost extends RPCHost {
         }
     }
 
-    assignChargeAmount(formatted: FormattedPage, crawlerOptions?: CrawlerOptions) {
+    assignChargeAmount(formatted: FormattedPage, saasTierPolicy?: Parameters<typeof this.saasApplyTierPolicy>[0]) {
         if (!formatted) {
             return 0;
         }
 
         let amount = 0;
         if (formatted.content) {
-            const x1 = estimateToken(formatted.content);
-            if (crawlerOptions?.respondWith?.toLowerCase().includes('lm')) {
-                amount += x1 * 2;
-            }
-            amount += x1;
+            amount = estimateToken(formatted.content);
         } else if (formatted.description) {
             amount += estimateToken(formatted.description);
         }
@@ -933,6 +917,10 @@ export class CrawlerHost extends RPCHost {
         if (formatted.screenshotUrl || formatted.screenshot) {
             // OpenAI image token count for 1024x1024 image
             amount += 765;
+        }
+
+        if (saasTierPolicy) {
+            amount = this.saasApplyTierPolicy(saasTierPolicy, amount);
         }
 
         Object.assign(formatted, { usage: { tokens: amount } });
@@ -1232,6 +1220,7 @@ export class CrawlerHost extends RPCHost {
         };
     }
 
+    proxyIterMap = new WeakMap<ExtraScrappingOptions, ReturnType<ProxyProviderService['iterAlloc']>>();
     @retryWith((err) => {
         if (err instanceof ServiceBadApproachError) {
             return false;
@@ -1250,8 +1239,17 @@ export class CrawlerHost extends RPCHost {
         if (opts?.allocProxy === 'none') {
             return this.curlControl.sideLoad(url, opts);
         }
+        let proxy;
+        if (opts) {
+            let it = this.proxyIterMap.get(opts);
+            if (!it) {
+                it = this.proxyProvider.iterAlloc(this.figureOutBestProxyCountry(opts));
+                this.proxyIterMap.set(opts, it);
+            }
+            proxy = (await it.next()).value;
+        }
 
-        const proxy = await this.proxyProvider.alloc(this.figureOutBestProxyCountry(opts));
+        proxy ??= await this.proxyProvider.alloc(this.figureOutBestProxyCountry(opts));
         this.logger.debug(`Proxy allocated`, { proxy: proxy.href });
         const r = await this.curlControl.sideLoad(url, {
             ...opts,
@@ -1283,8 +1281,6 @@ export class CrawlerHost extends RPCHost {
         if (opts.countryHint) {
             if (this.proxyProvider.supports(opts.countryHint)) {
                 draft ??= opts.countryHint;
-            } else if (opts.countryHint === 'cn') {
-                draft ??= 'hk';
             }
         }
 
@@ -1299,5 +1295,55 @@ export class CrawlerHost extends RPCHost {
         }
 
         return false;
+    }
+
+    async saasAssertTierPolicy(opts: CrawlerOptions, auth: JinaEmbeddingsAuthDTO) {
+        let chargeScalar = 1;
+        let minimalCharge = 0;
+
+        if (opts.withGeneratedAlt) {
+            await auth.assertTier(0, 'Alt text generation');
+            minimalCharge = 765;
+        }
+
+        if (opts.injectPageScript || opts.injectFrameScript) {
+            await auth.assertTier(0, 'Script injection');
+            minimalCharge = 4_000;
+        }
+
+        if (opts.withIframe) {
+            await auth.assertTier(0, 'Iframe');
+        }
+
+        if (opts.engine === ENGINE_TYPE.CF_BROWSER_RENDERING) {
+            await auth.assertTier(0, 'Cloudflare browser rendering');
+            minimalCharge = 4_000;
+        }
+
+        if (opts.respondWith.includes('lm') || opts.engine?.includes('lm')) {
+            await auth.assertTier(0, 'Language model');
+            minimalCharge = 4_000;
+            chargeScalar = 3;
+        }
+
+        if (opts.proxy && opts.proxy !== 'none') {
+            await auth.assertTier(['auto', 'any'].includes(opts.proxy) ? 0 : 2, 'Proxy allocation');
+            chargeScalar = 5;
+        }
+
+        return {
+            budget: opts.tokenBudget || 0,
+            chargeScalar,
+            minimalCharge,
+        };
+    }
+
+    saasApplyTierPolicy(policy: Awaited<ReturnType<typeof this.saasAssertTierPolicy>>, chargeAmount: number) {
+        const effectiveChargeAmount = policy.chargeScalar * Math.max(chargeAmount, policy.minimalCharge);
+        if (policy.budget && policy.budget < effectiveChargeAmount) {
+            throw new BudgetExceededError(`Token budget (${policy.budget}) exceeded, intended charge amount ${effectiveChargeAmount}`);
+        }
+
+        return effectiveChargeAmount;
     }
 }
